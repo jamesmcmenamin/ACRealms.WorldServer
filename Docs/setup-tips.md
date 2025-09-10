@@ -96,3 +96,129 @@ To restore a database backup from a dump script, after making sure that script d
 ACRealms will automatically detect whether you are running a server against data that was previously for an ACE Server. When this data is detected, a migration mode will be temporarily enabled during startup, and all characters will be transferred to the default realm you specified in `Config.realms.js`. This will include the transfer of houses owned by the characters, and the items on the hooks and storage. The guest lists may not transfer, however, as of the time of writing this document (v2.1.1). 
 
 
+## Clean reinitialize databases (non‑Docker, Windows Server)
+
+This is a precise, repeatable procedure to wipe old data and stand up a clean ACRealms database set using the SQL in this repo, then load a full world dump.
+
+Prereqs:
+
+- MySQL 8 installed locally and on PATH (`mysql --version`).
+- You know the MySQL root password, or have/create a service user.
+- This repo checked out (paths below assume `C:\ACE`).
+
+Important: ACRealms is not designed for Docker in production. Use native MySQL and run the server directly. See the project guidance in the main repo docs.
+
+### 1) Stop the server and back up anything you care about
+
+```
+taskkill /IM ACE.Server.exe /F 2>nul
+mysqldump -uroot -pYOURROOT ace_auth  > C:\ACE\backup-ace_auth.sql
+mysqldump -uroot -pYOURROOT ace_shard > C:\ACE\backup-ace_shard.sql
+mysqldump -uroot -pYOURROOT ace_world > C:\ACE\backup-ace_world.sql
+```
+
+### 2) Drop and recreate the databases and user
+
+Open an elevated PowerShell and run:
+
+```
+mysql -uroot -pYOURROOT -e "
+DROP DATABASE IF EXISTS ace_auth; DROP DATABASE IF EXISTS ace_shard; DROP DATABASE IF EXISTS ace_world;
+CREATE DATABASE ace_auth  CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE DATABASE ace_shard CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE DATABASE ace_world CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS 'ace'@'%' IDENTIFIED WITH mysql_native_password BY 'acepass';
+GRANT ALL PRIVILEGES ON ace_auth.*  TO 'ace'@'%';
+GRANT ALL PRIVILEGES ON ace_shard.* TO 'ace'@'%';
+GRANT ALL PRIVILEGES ON ace_world.* TO 'ace'@'%';
+FLUSH PRIVILEGES;"
+```
+
+### 3) Initialize clean schemas (Base‑Realms Unsafe)
+
+These DROP and recreate tables. Use the files in this repo:
+
+```
+cmd /c type "C:\ACE\Database\Base-Realms\Unsafe\AuthenticationBase.sql" | mysql -uace -pacepass ace_auth
+cmd /c type "C:\ACE\Database\Base-Realms\Unsafe\ShardBase.sql"          | mysql -uace -pacepass ace_shard
+cmd /c type "C:\ACE\Database\Base-Realms\Unsafe\WorldBase.sql"          | mysql -uace -pacepass ace_world
+```
+
+### 4) Apply ACRealms migrations (Shard → World)
+
+```
+Get-ChildItem "C:\ACE\Database\ACRealms\Shard\*.sql" | Sort-Object Name | ForEach-Object {
+  cmd /c type "`"$($_.FullName)`"" | mysql -uace -pacepass ace_shard
+}
+Get-ChildItem "C:\ACE\Database\ACRealms\World\*.sql" | Sort-Object Name | ForEach-Object {
+  cmd /c type "`"$($_.FullName)`"" | mysql -uace -pacepass ace_world
+}
+```
+
+### 5) Apply Updates (Shard)
+
+```
+Get-ChildItem "C:\ACE\Database\Updates\Shard\*.sql" | Sort-Object Name | ForEach-Object {
+  cmd /c type "`"$($_.FullName)`"" | mysql -uace -pacepass ace_shard
+}
+```
+
+### 6) Load a full world dump (required)
+
+This repository contains schemas and migrations, not the full world content. Download the latest world database release from ACE‑World‑16PY‑Patches and import it into `ace_world`.
+
+- Releases: https://github.com/ACEmulator/ACE-World-16PY-Patches (see Releases)
+
+Import examples:
+
+```
+# If you downloaded a .sql.gz to C:\ACE\world.sql.gz
+"C:\Program Files\7-Zip\7z.exe" e -so C:\ACE\world.sql.gz | mysql -uace -pacepass ace_world
+
+# If you downloaded a plain .sql to C:\ACE\world.sql
+cmd /c type "C:\ACE\world.sql" | mysql -uace -pacepass ace_world
+```
+
+Sanity check:
+
+```
+mysql -uace -pacepass -e "SELECT COUNT(*) AS weenies FROM ace_world.weenie;"
+mysql -uace -pacepass -e "SHOW TABLES IN ace_shard LIKE 'character';"
+```
+
+### 7) Configure server
+
+Edit `C:\ACE\Config\Config.js`:
+
+```
+"DatFilesDirectory": "c:\\ACE\\Dats\\",
+"ModsDirectory":     "c:\\ACE\\Mods\\",
+
+"MySql": {
+  "Authentication": { "Host": "127.0.0.1", "Port": 3306, "Database": "ace_auth",  "Username": "ace", "Password": "acepass" },
+  "Shard":          { "Host": "127.0.0.1", "Port": 3306, "Database": "ace_shard", "Username": "ace", "Password": "acepass" },
+  "World":          { "Host": "127.0.0.1", "Port": 3306, "Database": "ace_world", "Username": "ace", "Password": "acepass" }
+}
+```
+
+Ensure the four DAT files exist in `C:\ACE\Dats\` (client_cell_1.dat, client_portal.dat, client_highres.dat, client_local_English.dat).
+
+Open Windows Firewall inbound UDP 9000–9001.
+
+### 8) Build and run
+
+From repo root:
+
+```
+dotnet build .\Source\ACRealms.sln -c Release
+dotnet run --project .\Source\ACE.Server\ACE.Server.csproj -c Release
+```
+
+First account created will be promoted to admin if none exists.
+
+Troubleshooting quick refs:
+
+- “Table 'ace_shard.character' doesn't exist”: run steps 3–5 again, then load world dump (step 6).
+- “human (1) missing” (FATAL World Database): you didn’t import a full world dump (step 6).
+- DAT errors: fix `DatFilesDirectory` to a valid Windows path with doubled backslashes, ensure files exist.
+
